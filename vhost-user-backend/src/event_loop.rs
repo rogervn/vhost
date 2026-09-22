@@ -84,6 +84,7 @@ pub type VringEpollResult<T> = std::result::Result<T, VringEpollError>;
 pub struct VringEpollHandler<T: VhostUserBackend> {
     epoll: Epoll,
     backend: T,
+    num_backend_queues: usize,
     vrings: Vec<T::Vring>,
     thread_id: usize,
     exit_event_fd: Option<EventNotifier>,
@@ -112,10 +113,11 @@ where
         thread_id: usize,
     ) -> VringEpollResult<Self> {
         let epoll = Epoll::new().map_err(VringEpollError::EpollCreateFd)?;
+        let num_backend_queues = backend.num_queues();
         let exit_event_fd = backend.exit_event(thread_id);
 
         let exit_event_fd = if let Some((consumer, notifier)) = exit_event_fd {
-            let id = backend.num_queues();
+            let id = num_backend_queues;
             epoll
                 .ctl(
                     ControlOperation::Add,
@@ -131,7 +133,7 @@ where
         let vring_enabled_event_fd =
             new_event_consumer_and_notifier(EventFlag::NONBLOCK | EventFlag::CLOEXEC)
                 .map_err(VringEpollError::NewEventConsumerNotifier)?;
-        let vring_enabled_event = backend.num_queues() as u64;
+        let vring_enabled_event = num_backend_queues as u64;
         epoll
             .ctl(
                 ControlOperation::Add,
@@ -143,6 +145,7 @@ where
         Ok(VringEpollHandler {
             epoll,
             backend,
+            num_backend_queues,
             vrings,
             thread_id,
             exit_event_fd,
@@ -158,7 +161,7 @@ where
     /// called.
     pub fn register_listener(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
         // `data` range [0...num_queues] is reserved for queues and exit event.
-        if data <= self.backend.num_queues() as u64 {
+        if data <= self.num_backend_queues as u64 {
             Err(io::Error::from_raw_os_error(libc::EINVAL))
         } else {
             self.register_event(fd, ev_type, data)
@@ -171,7 +174,7 @@ where
     /// dropped.
     pub fn unregister_listener(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
         // `data` range [0...num_queues] is reserved for queues and exit event.
-        if data <= self.backend.num_queues() as u64 {
+        if data <= self.num_backend_queues as u64 {
             Err(io::Error::from_raw_os_error(libc::EINVAL))
         } else {
             self.unregister_event(fd, ev_type, data)
@@ -181,7 +184,7 @@ where
     pub(crate) fn register_event(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
         self.epoll
             .ctl(ControlOperation::Add, fd, EpollEvent::new(ev_type, data))?;
-        if data < self.backend.num_queues() as u64 {
+        if data < self.num_backend_queues as u64 {
             self.vrings_with_pending_events
                 .lock()
                 .unwrap()
@@ -192,7 +195,7 @@ where
     }
 
     pub(crate) fn unregister_event(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
-        if data < self.backend.num_queues() as u64 {
+        if data < self.num_backend_queues as u64 {
             self.vrings_with_pending_events
                 .lock()
                 .unwrap()
@@ -251,7 +254,7 @@ where
     }
 
     fn handle_event(&self, device_event: u16, evset: EventSet) -> VringEpollResult<bool> {
-        if device_event as usize == self.backend.num_queues() {
+        if device_event as usize == self.num_backend_queues {
             return self.handle_num_queues_event(evset);
         }
 
@@ -315,9 +318,38 @@ mod tests {
     use super::super::backend::tests::MockVhostBackend;
     use super::super::vring::VringRwLock;
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
     use vm_memory::{GuestAddress, GuestMemoryAtomic, GuestMemoryMmap};
     use vmm_sys_util::event::{new_event_consumer_and_notifier, EventFlag};
+
+    #[test]
+    fn test_register_event_does_not_wait_for_backend() {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
+        );
+        let vring = VringRwLock::new(mem, 0x1000).unwrap();
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let handler =
+            Arc::new(VringEpollHandler::new(backend.clone(), vec![vring.clone()], 0).unwrap());
+        let (consumer, _notifier) = new_event_consumer_and_notifier(EventFlag::NONBLOCK).unwrap();
+        let backend_guard = backend.lock().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let registration = std::thread::spawn(move || {
+            let _vring_guard = vring.get_ref();
+            let result = handler.register_event(consumer.as_raw_fd(), EventSet::IN, 0);
+            done_tx.send(result).unwrap();
+        });
+
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        drop(backend_guard);
+        registration.join().unwrap();
+
+        result
+            .expect("registering a vring must not wait for the backend lock")
+            .unwrap();
+    }
 
     #[test]
     fn test_vring_epoll_handler() {
